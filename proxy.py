@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, redirect, Response
 import requests
 import re
 import joblib
@@ -7,30 +7,17 @@ from sklearn.preprocessing import StandardScaler
 
 app = Flask(__name__)
 
-# Chargement du modèle ML, scaler et IPs fréquentes
+# Chargement du modèle, du scaler et des IPs communes
 model = joblib.load("traffic_classifier.pkl")
 scaler = joblib.load("scaler.pkl")
 common_ips = joblib.load("common_ips.pkl")
 
-# Règles du WAF améliorées
 BLOCKED_PATTERNS = [
-    r"union\s+select",           # SQLi
-    r"select\s.+\sfrom",         # SQLi
-    r"insert\s+into",            # SQLi
-    r"delete\s+from",            # SQLi
-    r"drop\s+table",             # SQLi
-    r"<script.*?>",              # XSS
-    r"alert\s*\(",               # XSS
-    r"onerror\s*=",              # XSS
-    r"eval\s*\(",                # JS Injection
-    r"cmd=",                     # Command Injection
-    r"wget\s+",                  # Command Injection
-    r"curl\s+",                  # Command Injection
-    r"\.\./",                    # Path Traversal
-    r"etc/passwd",               # File inclusion
+    r"union\s+select", r"select\s.+\sfrom", r"insert\s+into", r"delete\s+from",
+    r"drop\s+table", r"<script.*?>", r"alert\s*\(", r"onerror\s*=",
+    r"eval\s*\(", r"cmd=", r"wget\s+", r"curl\s+", r"\.\./", r"etc/passwd"
 ]
 
-# Utilitaires pour la détection
 def is_local_ip(ip):
     try:
         parts = ip.split('.')
@@ -65,7 +52,6 @@ def preprocess_request_for_ml(ip, method, path, status, size, referer):
         'Size': size,
         'Referer': referer or 'none'
     }])
-
     df['Path_Length'] = df['Path'].apply(len)
     df['Has_Percent'] = df['Path'].apply(lambda x: 1 if '%20' in x else 0)
     df['Has_Equal'] = df['Path'].apply(lambda x: 1 if '=' in x else 0)
@@ -112,41 +98,55 @@ def proxy(path):
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     full_path = f"/{path}?{query_string}" if query_string else f"/{path}"
 
-    # # WAF rule-based detection
+    print(f"[REQUEST] {method} {full_path} from {ip}")
+
+    # Rule-based WAF
     if any(is_malicious_rule_based(v) for v in request.args.values()):
-        return jsonify({"error": "Requete bloquee par le WAF : parametre GET suspect"}), 403
+        print("[BLOCKED] Rule-based detection")
+        return redirect("http://localhost:5173/blocked")
 
     if request.is_json and any(is_malicious_rule_based(str(v)) for v in request.json.values()):
-        return jsonify({"error": "Requete bloquee par le WAF : JSON suspect"}), 403
+        print("[BLOCKED] Rule-based detection (JSON)")
+        return redirect("http://localhost:5173/blocked")
 
     if is_malicious_rule_based(req_data) or is_malicious_rule_based(query_string):
-        return jsonify({"error": "Requete bloquee par le WAF : corps suspect"}), 403
+        print("[BLOCKED] Rule-based detection (body/query)")
+        return redirect("http://localhost:5173/blocked")
 
-    # ML-based detection
+    # ML-based WAF
     ml_input = preprocess_request_for_ml(
         ip=ip,
         method=method,
         path=full_path,
-        status=200,  # valeur fictive pour le moment
+        status=200,
         size=len(req_data),
         referer=request.headers.get("Referer", "-")
     )
-    
-
     prediction = model.predict(ml_input)[0]
     if prediction == 1:
-        return jsonify({"error": "Requete bloquee par le WAF (ML)"}), 403
+        print("[BLOCKED] ML model prediction")
+        return redirect("http://localhost:5173/blocked")
 
-    # Transfert au backend
-    backend_response = requests.request(
-        method=method,
-        url=f"http://localhost:5000/{path}",
-        headers={k: v for k, v in request.headers if k.lower() != "host"},
-        data=req_data,
-        params=request.args
-    )
-
-    return backend_response.content, backend_response.status_code, backend_response.headers.items()
+    # Forwarding to backend
+    try:
+        backend_response = requests.request(
+            method=method,
+            url=f"http://localhost:5000/{path}",
+            headers={k: v for k, v in request.headers if k.lower() != "host"},
+            data=req_data,
+            params=request.args
+        )
+        # Redirect to frontend if backend 404
+        if backend_response.status_code == 404:
+            return redirect("http://localhost:5173/normal")
+        return Response(
+            backend_response.content,
+            status=backend_response.status_code,
+            headers=dict(backend_response.headers)
+        )
+    except Exception as e:
+        print(f"[ERROR] Failed to reach backend: {e}")
+        return Response("Erreur interne du proxy.", status=500)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
